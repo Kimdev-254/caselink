@@ -1,14 +1,7 @@
 """
 Stage 1b (v2): Fetch each judgment, parse the labeled metadata sidebar,
-download the linked DOCX for the actual judgment text, and save one clean
-JSON file per case.
-
-Why v2: the judgment page itself only renders a PDF-viewer shell client-side
--- the real text lives in a downloadable .docx/.pdf file linked from the page.
-Grabbing that file directly is more reliable than scraping rendered text anyway.
-
-Usage:
-    python 2_fetch_cases.py --urls urls.txt --limit 100 --out cases/
+download the linked DOCX (or PDF fallback for legacy .doc cases), and
+save one clean JSON file per case.
 """
 import argparse
 import io
@@ -23,12 +16,12 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from docx import Document
+import pdfplumber
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (research prototype; contact: youremail@example.com)"
 }
 
-# Sidebar labels appear as "Label\nValue" pairs in the page's visible text.
 LABELS = {
     "citation": "Citation",
     "neutral_citation": "Media Neutral Citation",
@@ -48,19 +41,11 @@ def url_to_case_id(url: str) -> str:
 
 
 def extract_sidebar_fields(text: str) -> dict:
-    """Pull labeled metadata out of the flattened page text.
-
-    The sidebar renders as consecutive lines: label, then value, e.g.
-        Court
-        Employment and Labour Relations Court
-    We find each label and take the next non-empty line as its value.
-    """
     lines = [l.strip() for l in text.split("\n")]
     fields = {}
     for key, label in LABELS.items():
         for i, line in enumerate(lines):
             if line == label:
-                # value is the next non-empty line, skipping a stray "Copy" button label
                 for j in range(i + 1, min(i + 3, len(lines))):
                     val = lines[j].strip()
                     if val and val.lower() != "copy":
@@ -70,14 +55,35 @@ def extract_sidebar_fields(text: str) -> dict:
     return fields
 
 
-def find_docx_link(html: str, page_url: str) -> str | None:
+def find_document_link(html: str, page_url: str):
+    """Prefer .docx (cleanly parseable); fall back to PDF if only a
+    legacy .doc link exists, since python-docx can't read .doc files."""
     soup = BeautifulSoup(html, "html.parser")
+    docx_link = doc_link = pdf_link = None
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        path = urlparse(href).path
-        if path.lower().endswith(".docx"):
-            return urljoin(page_url, href)
-    return None
+        path = urlparse(href).path.lower()
+        if path.endswith(".docx"):
+            docx_link = urljoin(page_url, href)
+        elif path.endswith(".doc"):
+            doc_link = urljoin(page_url, href)
+        elif path.endswith(".pdf") or "/source.pdf" in path:
+            pdf_link = urljoin(page_url, href)
+    if docx_link:
+        return docx_link, "docx"
+    if pdf_link:
+        return pdf_link, "pdf"
+    return None, None
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+    return "\n".join(text_parts)
 
 
 def extract_docx_text(docx_bytes: bytes) -> str:
@@ -101,17 +107,18 @@ def fetch_one(url: str, out_dir: Path) -> str:
     page_text = soup.get_text("\n", strip=True)
 
     fields = extract_sidebar_fields(page_text)
-
-    # Case name is the page's title line -- first substantial line of text
     lines = [l for l in page_text.split("\n") if l.strip()]
     case_name = lines[0] if lines else None
 
-    docx_url = find_docx_link(html, url)
+    doc_url, filetype = find_document_link(html, url)
     full_text = None
-    if docx_url:
-        docx_resp = requests.get(docx_url, headers=HEADERS, timeout=30)
-        docx_resp.raise_for_status()
-        full_text = extract_docx_text(docx_resp.content)
+    if doc_url:
+        doc_resp = requests.get(doc_url, headers=HEADERS, timeout=30)
+        doc_resp.raise_for_status()
+        if filetype == "docx":
+            full_text = extract_docx_text(doc_resp.content)
+        elif filetype == "pdf":
+            full_text = extract_pdf_text(doc_resp.content)
 
     record = {
         "case_id": case_id,
@@ -123,14 +130,15 @@ def fetch_one(url: str, out_dir: Path) -> str:
         "judge": fields.get("judge"),
         "date": fields.get("date"),
         "source_url": url,
-        "docx_url": docx_url,
+        "doc_url": doc_url,
+        "doc_filetype": filetype,
         "full_text": full_text,
     }
 
     with open(out_path, "w") as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
 
-    status = "OK" if full_text else "OK (no docx found -- check manually)"
+    status = "OK" if full_text else "OK (no document found -- check manually)"
     return f"{status}: {case_id}"
 
 
