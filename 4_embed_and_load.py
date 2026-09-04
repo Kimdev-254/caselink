@@ -1,20 +1,20 @@
 """
-Stage 3: Embed chunks.jsonl with OpenAI and load everything into Postgres.
+Stage 3 (local): Embed chunks.jsonl with a local sentence-transformers
+model (BAAI/bge-small-en-v1.5) and load everything into Postgres.
 """
 import argparse
 import json
 import os
-import time
 
 import psycopg2
 from psycopg2.extras import execute_values
-from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-BATCH_SIZE = 100
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
+BATCH_SIZE = 32
 
 DB_CONFIG = {
     "host": "localhost",
@@ -65,21 +65,14 @@ def upsert_cases(conn, records):
     print(f"Upserted {len(seen)} unique cases.")
 
 
-def embed_batch(client, texts):
-    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chunks", type=str, default="chunks.jsonl")
     args = parser.parse_args()
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise SystemExit("OPENAI_API_KEY not found -- check your .env file.")
+    print(f"Loading local embedding model ({MODEL_NAME})... this may take a moment on first run.")
+    model = SentenceTransformer(MODEL_NAME)
 
-    client = OpenAI(api_key=api_key)
     conn = psycopg2.connect(**DB_CONFIG)
 
     records = load_chunks(args.chunks)
@@ -97,12 +90,7 @@ def main():
         batch = remaining[i : i + BATCH_SIZE]
         texts = [r["text"] for r in batch]
 
-        try:
-            embeddings = embed_batch(client, texts)
-        except Exception as e:
-            print(f"Batch {i}-{i+len(batch)} FAILED: {e}. Retrying once after a pause...")
-            time.sleep(5)
-            embeddings = embed_batch(client, texts)
+        embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
 
         rows = [
             (
@@ -111,7 +99,7 @@ def main():
                 r["chunk_index"],
                 r["text"],
                 r["word_count"],
-                "[" + ",".join(str(x) for x in emb) + "]",
+                "[" + ",".join(str(float(x)) for x in emb) + "]",
             )
             for r, emb in zip(batch, embeddings)
         ]
